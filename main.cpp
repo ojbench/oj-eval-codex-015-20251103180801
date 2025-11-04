@@ -8,7 +8,7 @@ using namespace std;
 
 const int MAX_KEY_LEN = 64;
 const int BLOCK_SIZE = 4096;
-const int ENTRIES_PER_BLOCK = BLOCK_SIZE / (MAX_KEY_LEN + 1 + 4 + 8); // ~50 entries
+const int ENTRIES_PER_BLOCK = 50; // Tune for performance
 
 struct Entry {
     char key[MAX_KEY_LEN + 1];
@@ -50,6 +50,8 @@ private:
     const char* filename = "storage.dat";
     fstream file;
     int num_blocks;
+    int rebuild_counter;
+    const int REBUILD_THRESHOLD = 100;
     
     void open_file() {
         file.open(filename, ios::in | ios::out | ios::binary);
@@ -63,6 +65,7 @@ private:
             streampos size = file.tellg();
             num_blocks = size / sizeof(Block);
         }
+        rebuild_counter = 0;
     }
     
     void read_block(int idx, Block& block) {
@@ -73,6 +76,9 @@ private:
     void write_block(int idx, const Block& block) {
         file.seekp(idx * sizeof(Block));
         file.write((const char*)&block, sizeof(Block));
+    }
+    
+    void flush_file() {
         file.flush();
     }
     
@@ -94,20 +100,46 @@ private:
         file.close();
         file.open(filename, ios::in | ios::out | ios::binary);
         
-        num_blocks = (all_entries.size() + ENTRIES_PER_BLOCK - 1) / ENTRIES_PER_BLOCK;
-        
-        for (int i = 0; i < num_blocks; i++) {
-            Block block;
-            int start = i * ENTRIES_PER_BLOCK;
-            int end = min((i + 1) * ENTRIES_PER_BLOCK, (int)all_entries.size());
-            block.count = end - start;
+        num_blocks = 0;
+        if (!all_entries.empty()) {
+            num_blocks = (all_entries.size() + ENTRIES_PER_BLOCK - 1) / ENTRIES_PER_BLOCK;
             
-            for (int j = 0; j < block.count; j++) {
-                block.entries[j] = all_entries[start + j];
+            for (int i = 0; i < num_blocks; i++) {
+                Block block;
+                int start = i * ENTRIES_PER_BLOCK;
+                int end = min((i + 1) * ENTRIES_PER_BLOCK, (int)all_entries.size());
+                block.count = end - start;
+                
+                for (int j = 0; j < block.count; j++) {
+                    block.entries[j] = all_entries[start + j];
+                }
+                
+                write_block(i, block);
             }
-            
-            write_block(i, block);
         }
+        
+        flush_file();
+        rebuild_counter = 0;
+    }
+    
+    int find_insertion_block(const Entry& entry) {
+        int left = 0, right = num_blocks - 1;
+        int result = num_blocks;
+        
+        while (left <= right) {
+            int mid = (left + right) / 2;
+            Block block;
+            read_block(mid, block);
+            
+            if (block.count > 0 && entry < block.entries[0]) {
+                result = mid;
+                right = mid - 1;
+            } else {
+                left = mid + 1;
+            }
+        }
+        
+        return result;
     }
     
 public:
@@ -124,11 +156,31 @@ public:
     void insert(const char* key, int value) {
         Entry new_entry(key, value);
         
-        for (int i = 0; i < num_blocks; i++) {
+        rebuild_counter++;
+        
+        if (num_blocks == 0) {
+            Block block;
+            block.count = 1;
+            block.entries[0] = new_entry;
+            write_block(0, block);
+            num_blocks = 1;
+            flush_file();
+            return;
+        }
+        
+        int target_block = find_insertion_block(new_entry);
+        
+        if (target_block > 0) {
+            target_block--;
+        }
+        
+        for (int i = target_block; i < num_blocks; i++) {
             Block block;
             read_block(i, block);
             
-            if (block.count < ENTRIES_PER_BLOCK) {
+            if (block.count < ENTRIES_PER_BLOCK && 
+                (i == num_blocks - 1 || new_entry < block.entries[block.count - 1] || 
+                 block.count == 0)) {
                 int j = block.count - 1;
                 while (j >= 0 && new_entry < block.entries[j]) {
                     block.entries[j + 1] = block.entries[j];
@@ -137,24 +189,20 @@ public:
                 block.entries[j + 1] = new_entry;
                 block.count++;
                 write_block(i, block);
-                return;
-            } else if (i == num_blocks - 1) {
-                Block new_block;
-                new_block.count = 1;
-                new_block.entries[0] = new_entry;
-                write_block(num_blocks, new_block);
-                num_blocks++;
-                rebuild();
+                flush_file();
                 return;
             }
         }
         
-        if (num_blocks == 0) {
-            Block block;
-            block.count = 1;
-            block.entries[0] = new_entry;
-            write_block(0, block);
-            num_blocks = 1;
+        Block new_block;
+        new_block.count = 1;
+        new_block.entries[0] = new_entry;
+        write_block(num_blocks, new_block);
+        num_blocks++;
+        flush_file();
+        
+        if (rebuild_counter >= REBUILD_THRESHOLD) {
+            rebuild();
         }
     }
     
@@ -172,6 +220,7 @@ public:
                     }
                     block.count--;
                     write_block(i, block);
+                    flush_file();
                     return;
                 }
             }
