@@ -3,11 +3,12 @@
 #include <cstring>
 #include <vector>
 #include <algorithm>
+#include <cstdio>
 
 using namespace std;
 
 const int MAX_KEY_LEN = 64;
-const int BUFFER_SIZE = 500; // Buffer writes before flushing
+const int CHUNK_SIZE = 800; // Balance between memory and performance
 
 struct Entry {
     char key[MAX_KEY_LEN + 1];
@@ -42,10 +43,22 @@ private:
     const char* filename = "storage.dat";
     vector<Entry> buffer;
     
-    void flush() {
+    void flush_buffer() {
         if (buffer.empty()) return;
         
-        // Load existing data
+        // Append buffer to file (unsorted)
+        ofstream fout(filename, ios::binary | ios::app);
+        for (const auto& entry : buffer) {
+            fout.write((const char*)&entry, sizeof(Entry));
+        }
+        fout.close();
+        buffer.clear();
+    }
+    
+    void sort_file() {
+        flush_buffer();
+        
+        // Read all and sort
         vector<Entry> all_data;
         ifstream fin(filename, ios::binary);
         if (fin) {
@@ -56,15 +69,9 @@ private:
             fin.close();
         }
         
-        // Merge with buffer
-        for (const auto& e : buffer) {
-            all_data.push_back(e);
-        }
-        buffer.clear();
-        
-        // Sort and write back
         sort(all_data.begin(), all_data.end());
         
+        // Write back
         ofstream fout(filename, ios::binary | ios::trunc);
         for (const auto& entry : all_data) {
             fout.write((const char*)&entry, sizeof(Entry));
@@ -76,46 +83,52 @@ public:
     FileStorage() {}
     
     ~FileStorage() {
-        flush();
+        flush_buffer();
     }
     
     void insert(const char* key, int value) {
         buffer.push_back(Entry(key, value));
         
-        if (buffer.size() >= BUFFER_SIZE) {
-            flush();
+        if (buffer.size() >= CHUNK_SIZE) {
+            flush_buffer();
         }
     }
     
     void remove(const char* key, int value) {
-        flush(); // Ensure all data is on disk
+        flush_buffer();
         
         Entry target(key, value);
-        vector<Entry> all_data;
+        const char* temp_file = "temp.dat";
         
         ifstream fin(filename, ios::binary);
+        ofstream fout(temp_file, ios::binary);
+        
         if (fin) {
             Entry entry;
             while (fin.read((char*)&entry, sizeof(Entry))) {
                 if (!(entry == target)) {
-                    all_data.push_back(entry);
+                    fout.write((const char*)&entry, sizeof(Entry));
                 }
             }
             fin.close();
         }
-        
-        ofstream fout(filename, ios::binary | ios::trunc);
-        for (const auto& entry : all_data) {
-            fout.write((const char*)&entry, sizeof(Entry));
-        }
         fout.close();
+        
+        std::remove(filename);
+        rename(temp_file, filename);
     }
     
     vector<int> find(const char* key) {
-        flush(); // Ensure all data is on disk
-        
         vector<int> result;
         
+        // Search buffer
+        for (const auto& entry : buffer) {
+            if (entry.same_key(key)) {
+                result.push_back(entry.value);
+            }
+        }
+        
+        // Search file
         ifstream fin(filename, ios::binary);
         if (fin) {
             Entry entry;
