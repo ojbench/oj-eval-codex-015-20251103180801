@@ -7,8 +7,7 @@
 using namespace std;
 
 const int MAX_KEY_LEN = 64;
-const int BLOCK_SIZE = 4096;
-const int MAX_ENTRIES = (BLOCK_SIZE - 16) / (MAX_KEY_LEN + 1 + 4); // ~55 entries per block
+const int BUFFER_SIZE = 500; // Buffer writes before flushing
 
 struct Entry {
     char key[MAX_KEY_LEN + 1];
@@ -38,122 +37,94 @@ struct Entry {
     }
 };
 
-struct Block {
-    int count;
-    int next;
-    Entry entries[MAX_ENTRIES];
-    
-    Block() : count(0), next(-1) {}
-};
-
 class FileStorage {
 private:
     const char* filename = "storage.dat";
-    fstream file;
-    int num_blocks;
+    vector<Entry> buffer;
     
-    void open_file() {
-        file.open(filename, ios::in | ios::out | ios::binary);
-        if (!file.is_open()) {
-            file.open(filename, ios::out | ios::binary);
-            file.close();
-            file.open(filename, ios::in | ios::out | ios::binary);
-            num_blocks = 0;
-        } else {
-            file.seekg(0, ios::end);
-            streampos size = file.tellg();
-            num_blocks = size / sizeof(Block);
+    void flush() {
+        if (buffer.empty()) return;
+        
+        // Load existing data
+        vector<Entry> all_data;
+        ifstream fin(filename, ios::binary);
+        if (fin) {
+            Entry entry;
+            while (fin.read((char*)&entry, sizeof(Entry))) {
+                all_data.push_back(entry);
+            }
+            fin.close();
         }
-    }
-    
-    void read_block(int idx, Block& block) {
-        file.seekg(idx * sizeof(Block));
-        file.read((char*)&block, sizeof(Block));
-    }
-    
-    void write_block(int idx, const Block& block) {
-        file.seekp(idx * sizeof(Block));
-        file.write((const char*)&block, sizeof(Block));
-        file.flush();
+        
+        // Merge with buffer
+        for (const auto& e : buffer) {
+            all_data.push_back(e);
+        }
+        buffer.clear();
+        
+        // Sort and write back
+        sort(all_data.begin(), all_data.end());
+        
+        ofstream fout(filename, ios::binary | ios::trunc);
+        for (const auto& entry : all_data) {
+            fout.write((const char*)&entry, sizeof(Entry));
+        }
+        fout.close();
     }
     
 public:
-    FileStorage() {
-        open_file();
-    }
+    FileStorage() {}
     
     ~FileStorage() {
-        if (file.is_open()) {
-            file.close();
-        }
+        flush();
     }
     
     void insert(const char* key, int value) {
-        Entry new_entry(key, value);
+        buffer.push_back(Entry(key, value));
         
-        if (num_blocks == 0) {
-            Block block;
-            block.count = 1;
-            block.entries[0] = new_entry;
-            write_block(0, block);
-            num_blocks = 1;
-            return;
-        }
-        
-        int block_idx = num_blocks - 1;
-        Block block;
-        read_block(block_idx, block);
-        
-        if (block.count < MAX_ENTRIES) {
-            int i = block.count - 1;
-            while (i >= 0 && new_entry < block.entries[i]) {
-                block.entries[i + 1] = block.entries[i];
-                i--;
-            }
-            block.entries[i + 1] = new_entry;
-            block.count++;
-            write_block(block_idx, block);
-        } else {
-            Block new_block;
-            new_block.count = 1;
-            new_block.entries[0] = new_entry;
-            write_block(num_blocks, new_block);
-            num_blocks++;
+        if (buffer.size() >= BUFFER_SIZE) {
+            flush();
         }
     }
     
     void remove(const char* key, int value) {
-        Entry target(key, value);
+        flush(); // Ensure all data is on disk
         
-        for (int i = 0; i < num_blocks; i++) {
-            Block block;
-            read_block(i, block);
-            
-            for (int j = 0; j < block.count; j++) {
-                if (block.entries[j] == target) {
-                    for (int k = j; k < block.count - 1; k++) {
-                        block.entries[k] = block.entries[k + 1];
-                    }
-                    block.count--;
-                    write_block(i, block);
-                    return;
+        Entry target(key, value);
+        vector<Entry> all_data;
+        
+        ifstream fin(filename, ios::binary);
+        if (fin) {
+            Entry entry;
+            while (fin.read((char*)&entry, sizeof(Entry))) {
+                if (!(entry == target)) {
+                    all_data.push_back(entry);
                 }
             }
+            fin.close();
         }
+        
+        ofstream fout(filename, ios::binary | ios::trunc);
+        for (const auto& entry : all_data) {
+            fout.write((const char*)&entry, sizeof(Entry));
+        }
+        fout.close();
     }
     
     vector<int> find(const char* key) {
+        flush(); // Ensure all data is on disk
+        
         vector<int> result;
         
-        for (int i = 0; i < num_blocks; i++) {
-            Block block;
-            read_block(i, block);
-            
-            for (int j = 0; j < block.count; j++) {
-                if (block.entries[j].same_key(key)) {
-                    result.push_back(block.entries[j].value);
+        ifstream fin(filename, ios::binary);
+        if (fin) {
+            Entry entry;
+            while (fin.read((char*)&entry, sizeof(Entry))) {
+                if (entry.same_key(key)) {
+                    result.push_back(entry.value);
                 }
             }
+            fin.close();
         }
         
         sort(result.begin(), result.end());
