@@ -7,8 +7,7 @@
 using namespace std;
 
 const int MAX_KEY_LEN = 64;
-const int BLOCK_SIZE = 4096;
-const int ENTRIES_PER_BLOCK = 50; // Tune for performance
+const int CACHE_SIZE = 300; // Keep a cache to reduce file I/O
 
 struct Entry {
     char key[MAX_KEY_LEN + 1];
@@ -38,206 +37,80 @@ struct Entry {
     }
 };
 
-struct Block {
-    int count;
-    Entry entries[ENTRIES_PER_BLOCK];
-    
-    Block() : count(0) {}
-};
-
 class FileStorage {
 private:
     const char* filename = "storage.dat";
-    fstream file;
-    int num_blocks;
-    int rebuild_counter;
-    const int REBUILD_THRESHOLD = 100;
+    vector<Entry> cache;
     
-    void open_file() {
-        file.open(filename, ios::in | ios::out | ios::binary);
-        if (!file.is_open()) {
-            file.open(filename, ios::out | ios::binary);
+    vector<Entry> load_all() {
+        vector<Entry> all_entries(cache);
+        
+        ifstream file(filename, ios::binary);
+        if (file.is_open()) {
+            Entry entry;
+            while (file.read((char*)&entry, sizeof(Entry))) {
+                all_entries.push_back(entry);
+            }
             file.close();
-            file.open(filename, ios::in | ios::out | ios::binary);
-            num_blocks = 0;
-        } else {
-            file.seekg(0, ios::end);
-            streampos size = file.tellg();
-            num_blocks = size / sizeof(Block);
-        }
-        rebuild_counter = 0;
-    }
-    
-    void read_block(int idx, Block& block) {
-        file.seekg(idx * sizeof(Block));
-        file.read((char*)&block, sizeof(Block));
-    }
-    
-    void write_block(int idx, const Block& block) {
-        file.seekp(idx * sizeof(Block));
-        file.write((const char*)&block, sizeof(Block));
-    }
-    
-    void flush_file() {
-        file.flush();
-    }
-    
-    void rebuild() {
-        vector<Entry> all_entries;
-        
-        for (int i = 0; i < num_blocks; i++) {
-            Block block;
-            read_block(i, block);
-            for (int j = 0; j < block.count; j++) {
-                all_entries.push_back(block.entries[j]);
-            }
         }
         
+        return all_entries;
+    }
+    
+    void save_all(const vector<Entry>& entries) {
+        ofstream file(filename, ios::binary | ios::trunc);
+        for (const auto& entry : entries) {
+            file.write((const char*)&entry, sizeof(Entry));
+        }
+        file.close();
+        cache.clear();
+    }
+    
+    void flush_cache() {
+        if (cache.empty()) return;
+        
+        vector<Entry> all_entries = load_all();
         sort(all_entries.begin(), all_entries.end());
-        
-        file.close();
-        file.open(filename, ios::out | ios::binary | ios::trunc);
-        file.close();
-        file.open(filename, ios::in | ios::out | ios::binary);
-        
-        num_blocks = 0;
-        if (!all_entries.empty()) {
-            num_blocks = (all_entries.size() + ENTRIES_PER_BLOCK - 1) / ENTRIES_PER_BLOCK;
-            
-            for (int i = 0; i < num_blocks; i++) {
-                Block block;
-                int start = i * ENTRIES_PER_BLOCK;
-                int end = min((i + 1) * ENTRIES_PER_BLOCK, (int)all_entries.size());
-                block.count = end - start;
-                
-                for (int j = 0; j < block.count; j++) {
-                    block.entries[j] = all_entries[start + j];
-                }
-                
-                write_block(i, block);
-            }
-        }
-        
-        flush_file();
-        rebuild_counter = 0;
-    }
-    
-    int find_insertion_block(const Entry& entry) {
-        int left = 0, right = num_blocks - 1;
-        int result = num_blocks;
-        
-        while (left <= right) {
-            int mid = (left + right) / 2;
-            Block block;
-            read_block(mid, block);
-            
-            if (block.count > 0 && entry < block.entries[0]) {
-                result = mid;
-                right = mid - 1;
-            } else {
-                left = mid + 1;
-            }
-        }
-        
-        return result;
+        save_all(all_entries);
     }
     
 public:
-    FileStorage() {
-        open_file();
-    }
+    FileStorage() {}
     
     ~FileStorage() {
-        if (file.is_open()) {
-            file.close();
-        }
+        flush_cache();
     }
     
     void insert(const char* key, int value) {
         Entry new_entry(key, value);
+        cache.push_back(new_entry);
         
-        rebuild_counter++;
-        
-        if (num_blocks == 0) {
-            Block block;
-            block.count = 1;
-            block.entries[0] = new_entry;
-            write_block(0, block);
-            num_blocks = 1;
-            flush_file();
-            return;
-        }
-        
-        int target_block = find_insertion_block(new_entry);
-        
-        if (target_block > 0) {
-            target_block--;
-        }
-        
-        for (int i = target_block; i < num_blocks; i++) {
-            Block block;
-            read_block(i, block);
-            
-            if (block.count < ENTRIES_PER_BLOCK && 
-                (i == num_blocks - 1 || new_entry < block.entries[block.count - 1] || 
-                 block.count == 0)) {
-                int j = block.count - 1;
-                while (j >= 0 && new_entry < block.entries[j]) {
-                    block.entries[j + 1] = block.entries[j];
-                    j--;
-                }
-                block.entries[j + 1] = new_entry;
-                block.count++;
-                write_block(i, block);
-                flush_file();
-                return;
-            }
-        }
-        
-        Block new_block;
-        new_block.count = 1;
-        new_block.entries[0] = new_entry;
-        write_block(num_blocks, new_block);
-        num_blocks++;
-        flush_file();
-        
-        if (rebuild_counter >= REBUILD_THRESHOLD) {
-            rebuild();
+        if (cache.size() >= CACHE_SIZE) {
+            flush_cache();
         }
     }
     
     void remove(const char* key, int value) {
+        flush_cache();
+        
+        vector<Entry> all_entries = load_all();
         Entry target(key, value);
         
-        for (int i = 0; i < num_blocks; i++) {
-            Block block;
-            read_block(i, block);
-            
-            for (int j = 0; j < block.count; j++) {
-                if (block.entries[j] == target) {
-                    for (int k = j; k < block.count - 1; k++) {
-                        block.entries[k] = block.entries[k + 1];
-                    }
-                    block.count--;
-                    write_block(i, block);
-                    flush_file();
-                    return;
-                }
-            }
+        auto it = std::find(all_entries.begin(), all_entries.end(), target);
+        if (it != all_entries.end()) {
+            all_entries.erase(it);
+            save_all(all_entries);
         }
     }
     
     vector<int> find(const char* key) {
         vector<int> result;
         
-        for (int i = 0; i < num_blocks; i++) {
-            Block block;
-            read_block(i, block);
-            
-            for (int j = 0; j < block.count; j++) {
-                if (block.entries[j].same_key(key)) {
-                    result.push_back(block.entries[j].value);
-                }
+        vector<Entry> all_entries = load_all();
+        
+        for (const auto& entry : all_entries) {
+            if (entry.same_key(key)) {
+                result.push_back(entry.value);
             }
         }
         
